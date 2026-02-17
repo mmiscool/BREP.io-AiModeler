@@ -1,0 +1,393 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>OpenAI Tool-Calling → SVG (Client-Side, ES6)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    :root {
+      --bg: #0b0e14;
+      --panel: #121826;
+      --text: #d1e0ff;
+      --muted: #8aa0c6;
+      --accent: #7aa2ff;
+      --border: #273043;
+      --ok: #58d68d;
+      --err: #ff6b6b;
+    }
+    html, body { height: 100%; }
+    body {
+      margin: 0; background: var(--bg); color: var(--text);
+      font: 14px/1.5 system-ui, -apple-system, Segoe UI, Roboto, Inter, "Helvetica Neue", Arial, sans-serif;
+      display: grid; grid-template-rows: auto 1fr; gap: 12px;
+    }
+    header {
+      display: grid; gap: 12px; padding: 16px; background: var(--panel); border-bottom: 1px solid var(--border);
+    }
+    .row { display: grid; grid-template-columns: 1fr auto; gap: 12px; align-items: center; }
+    .controls { display: grid; grid-template-columns: minmax(220px, 420px) 1fr auto auto; gap: 12px; }
+    input, textarea, button, select {
+      font: inherit; color: var(--text); background: #0e1422; border: 1px solid var(--border);
+      border-radius: 10px; padding: 10px 12px; outline: none;
+    }
+    input::placeholder, textarea::placeholder { color: var(--muted); }
+    button { cursor: pointer; background: #0f1530; transition: 120ms border-color, 120ms transform; }
+    button:hover { border-color: var(--accent); transform: translateY(-1px); }
+    button.primary { background: #111b3a; border-color: #263a7a; }
+    button.danger { background: #2a1216; border-color: #472126; color: #ffadb0; }
+    .layout {
+      display: grid;
+      grid-template-columns: 1.2fr 0.8fr;
+      gap: 12px;
+      padding: 0 16px 16px;
+      min-height: 0;
+    }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      min-height: 0;
+      display: grid;
+      grid-template-rows: auto 1fr;
+    }
+    .card h2 { margin: 0; padding: 12px 14px; font-size: 13px; letter-spacing: .05em; color: var(--muted); border-bottom: 1px solid var(--border); }
+    #canvasWrap { position: relative; overflow: hidden; }
+    #svgCanvas {
+      width: 100%; height: 100%;
+      background: #0a0f1d;
+    }
+    .log {
+      padding: 12px; overflow: auto; white-space: pre-wrap; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+    .pill { display: inline-block; padding: 3px 8px; border-radius: 999px; border: 1px solid var(--border); color: var(--muted); font-size: 12px; }
+    .pill.ok { color: var(--ok); border-color: #285c47; background: #0a1f19; }
+    .pill.err { color: var(--err); border-color: #5a2b2b; background: #1c0f0f; }
+    .rowline { display: flex; gap: 6px; align-items: center; }
+    .muted { color: var(--muted); }
+    .hint { font-size: 12px; color: var(--muted); }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="controls">
+      <input id="apiKey" type="password" placeholder="OpenAI API Key (stored locally)" />
+      <input id="systemPrompt" type="text" placeholder="System prompt for the drawing agent…" />
+      <button id="saveKey" class="primary">Save Key</button>
+      <button id="clearKey" class="danger">Clear Key</button>
+    </div>
+    <div class="row">
+      <textarea id="userInput" rows="3" placeholder="Describe shapes to draw, e.g. ‘circle at 200,150 radius 80; line from 50,50 to 350,250; rectangle from 100,100 to 280,220’. The model will choose which tools to call."></textarea>
+      <div class="rowline">
+        <select id="model">
+          <option value="gpt-4o-mini">gpt-4o-mini</option>
+          <option value="gpt-4o">gpt-4o</option>
+        </select>
+        <button id="run" class="primary">Generate with Tools</button>
+        <button id="clearCanvas">Clear Canvas</button>
+      </div>
+    </div>
+    <div class="hint">
+      Tools available to the model: <span class="pill">draw_circle</span> <span class="pill">draw_line</span> <span class="pill">draw_rect</span>
+      &nbsp;•&nbsp; Uses Chat Completions tool calling under the hood.
+    </div>
+  </header>
+
+  <main class="layout">
+    <section class="card" style="min-height: 420px;">
+      <h2>SVG Canvas</h2>
+      <div id="canvasWrap">
+        <svg id="svgCanvas" viewBox="0 0 800 600" xmlns="http://www.w3.org/2000/svg">
+          <defs>
+            <style>
+              .stroke-default { stroke: #9fb3ff; stroke-width: 2; }
+              .fill-none { fill: none; }
+            </style>
+          </defs>
+          <rect x="0" y="0" width="800" height="600" fill="#0a0f1d" />
+        </svg>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Run Log</h2>
+      <div id="log" class="log"></div>
+    </section>
+  </main>
+
+  <!-- ESM build of official openai SDK; works in browser with dangerouslyAllowBrowser -->
+  <script type="module">
+    import OpenAI from "https://esm.sh/openai@4";
+
+    // Persist API key locally (never safe for production)
+    const $ = (id) => document.getElementById(id);
+    const apiKeyInput = $("apiKey");
+    const saveKeyBtn = $("saveKey");
+    const clearKeyBtn = $("clearKey");
+    const runBtn = $("run");
+    const clearCanvasBtn = $("clearCanvas");
+    const userInput = $("userInput");
+    const systemPrompt = $("systemPrompt");
+    const modelSel = $("model");
+    const logEl = $("log");
+    const svg = $("svgCanvas");
+
+    apiKeyInput.value = localStorage.getItem("OPENAI_API_KEY") ?? "";
+    systemPrompt.value = localStorage.getItem("SVG_SYSTEM_PROMPT") ??
+      "You are an SVG drawing agent for a parametric CAD sketcher. " +
+      "Translate user requests for simple geometry into tool calls only. " +
+      "Use pixels for coordinates. Prefer integers for clarity. " +
+      "If color is omitted, use stroke=#9fb3ff and no fill. " +
+      "If multiple shapes are requested, you may call multiple tools in one message. " +
+      "Otherwise, avoid verbose text; a brief summary is fine after drawing.";
+
+    saveKeyBtn.onclick = () => {
+      localStorage.setItem("OPENAI_API_KEY", apiKeyInput.value.trim());
+      localStorage.setItem("SVG_SYSTEM_PROMPT", systemPrompt.value.trim());
+      appendLog("Saved API key & prompt.", "ok");
+    };
+    clearKeyBtn.onclick = () => {
+      localStorage.removeItem("OPENAI_API_KEY");
+      appendLog("Cleared stored key.", "err");
+      apiKeyInput.value = "";
+    };
+
+    clearCanvasBtn.onclick = () => {
+      resetCanvas();
+      appendLog("Canvas cleared.", "ok");
+    };
+
+    function appendLog(msg, level = "info") {
+      const badge = level === "ok" ? "pill ok" : level === "err" ? "pill err" : "pill";
+      const time = new Date().toLocaleTimeString();
+      logEl.innerHTML += `[${time}] <span class="${badge}">${level}</span> ${escapeHtml(msg)}\n`;
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+    function escapeHtml(s) {
+      return s.replace(/[&<>"']/g, (c) => ({ "&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;" }[c]));
+    }
+
+    // ----- SVG Helpers (shared canvas) -----
+    function resetCanvas() {
+      // Remove all children except the background rect & <defs>
+      const keep = new Set(["defs", "bgrect"]);
+      // Rebuild a fresh canvas: simpler and deterministic
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      const defs = document.createElementNS("http://www.w3.org/2000/svg", "defs");
+      defs.innerHTML = `<style>.stroke-default{stroke:#9fb3ff;stroke-width:2}.fill-none{fill:none}</style>`;
+      const bg = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+      bg.setAttribute("x", "0"); bg.setAttribute("y", "0");
+      bg.setAttribute("width", "800"); bg.setAttribute("height", "600");
+      bg.setAttribute("fill", "#0a0f1d"); bg.setAttribute("id", "bgrect");
+      svg.appendChild(defs);
+      svg.appendChild(bg);
+    }
+    resetCanvas();
+
+    function drawCircle({ x, y, r, stroke = "#9fb3ff", fill = "none", id }) {
+      const c = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+      c.setAttribute("cx", toNum(x));
+      c.setAttribute("cy", toNum(y));
+      c.setAttribute("r", Math.max(0, toNum(r)));
+      c.setAttribute("stroke", stroke);
+      c.setAttribute("fill", fill);
+      c.setAttribute("stroke-width", "2");
+      if (id) c.setAttribute("id", id);
+      svg.appendChild(c);
+      return { ok: true, id: id ?? autoId("circle"), type: "circle" };
+    }
+    function drawLine({ x1, y1, x2, y2, stroke = "#9fb3ff", id }) {
+      const l = document.createElementNS("http://www.w3.org/2000/svg", "line");
+      l.setAttribute("x1", toNum(x1));
+      l.setAttribute("y1", toNum(y1));
+      l.setAttribute("x2", toNum(x2));
+      l.setAttribute("y2", toNum(y2));
+      l.setAttribute("stroke", stroke);
+      l.setAttribute("stroke-width", "2");
+      l.setAttribute("fill", "none");
+      if (id) l.setAttribute("id", id);
+      svg.appendChild(l);
+      return { ok: true, id: id ?? autoId("line"), type: "line" };
+    }
+    function drawRect({ x1, y1, x2, y2, stroke = "#9fb3ff", fill = "none", id }) {
+      const rx = Math.min(toNum(x1), toNum(x2));
+      const ry = Math.min(toNum(y1), toNum(y2));
+      const w = Math.abs(toNum(x2) - toNum(x1));
+      const h = Math.abs(toNum(y2) - toNum(y1));
+      const r = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+      r.setAttribute("x", rx); r.setAttribute("y", ry);
+      r.setAttribute("width", w); r.setAttribute("height", h);
+      r.setAttribute("stroke", stroke); r.setAttribute("fill", fill);
+      r.setAttribute("stroke-width", "2");
+      if (id) r.setAttribute("id", id);
+      svg.appendChild(r);
+      return { ok: true, id: id ?? autoId("rect"), type: "rect" };
+    }
+    const toNum = (v) => Number.parseFloat(v);
+    const autoId = (pfx) => `${pfx}-${Math.random().toString(36).slice(2, 8)}`;
+
+    // ----- Tool schema exposed to the model -----
+    // Using Chat Completions tool calling (stable + simple loop)
+    const toolSpecs = [
+      {
+        type: "function",
+        function: {
+          name: "draw_circle",
+          description: "Create a circle on the shared SVG canvas.",
+          parameters: {
+            type: "object",
+            properties: {
+              x: { type: "number", description: "Center X in pixels" },
+              y: { type: "number", description: "Center Y in pixels" },
+              r: { type: "number", description: "Radius in pixels" },
+              stroke: { type: "string", description: "Stroke color (CSS color)", default: "#9fb3ff" },
+              fill: { type: "string", description: "Fill color (CSS color) or 'none'", default: "none" },
+              id: { type: "string", description: "Optional element id to assign" }
+            },
+            required: ["x", "y", "r"]
+          }
+        }
+      },
+      {
+        type: "function",
+        function: {
+          name: "draw_line",
+          description: "Create a line from one point to another on the shared SVG canvas.",
+          parameters: {
+            type: "object",
+            properties: {
+              x1: { type: "number", description: "Start X" },
+              y1: { type: "number", description: "Start Y" },
+              x2: { type: "number", description: "End X" },
+              y2: { type: "number", description: "End Y" },
+              stroke: { type: "string", description: "Stroke color (CSS color)", default: "#9fb3ff" },
+              id: { type: "string", description: "Optional element id to assign" }
+            },
+            required: ["x1", "y1", "x2", "y2"]
+          }
+        }
+      },
+      {
+        type: "function",
+        function: {
+          name: "draw_rect",
+          description: "Create an axis-aligned rectangle from two opposite corner points on the shared SVG canvas.",
+          parameters: {
+            type: "object",
+            properties: {
+              x1: { type: "number", description: "Corner 1 X" },
+              y1: { type: "number", description: "Corner 1 Y" },
+              x2: { type: "number", description: "Corner 2 X" },
+              y2: { type: "number", description: "Corner 2 Y" },
+              stroke: { type: "string", description: "Stroke color (CSS color)", default: "#9fb3ff" },
+              fill: { type: "string", description: "Fill color (CSS color) or 'none'", default: "none" },
+              id: { type: "string", description: "Optional element id to assign" }
+            },
+            required: ["x1", "y1", "x2", "y2"]
+          }
+        }
+      }
+    ];
+
+    const toolRouter = {
+      draw_circle: drawCircle,
+      draw_line: drawLine,
+      draw_rect: drawRect
+    };
+
+    runBtn.onclick = async () => {
+      const key = apiKeyInput.value.trim();
+      if (!key) {
+        appendLog("No API key provided.", "err");
+        return;
+      }
+      // Initialize client (client-side usage requires this flag)
+      // Ref: official SDK pattern allowing browser usage with `dangerouslyAllowBrowser`
+      // (See OpenAI cookbook example for agents/tools in browser)
+      const client = new OpenAI({ apiKey: key, dangerouslyAllowBrowser: true });
+
+      const model = modelSel.value;
+      const sys = systemPrompt.value.trim();
+      const prompt = userInput.value.trim();
+      if (!prompt) { appendLog("Enter an instruction to draw.", "err"); return; }
+
+      appendLog(`→ Asking ${model}: ${prompt}`);
+
+      // Chat Completions with tool-calling loop
+      // We’ll let the model call tools, execute locally, return tool results,
+      // and repeat until there are no further tool calls.
+      const messages = [
+        { role: "system", content: sys },
+        { role: "user", content: prompt }
+      ];
+
+      // Safety: hard stop after several tool turns
+      for (let step = 0; step < 6; step++) {
+        const completion = await client.chat.completions.create({
+          model,
+          messages,
+          temperature: 0,
+          tools: toolSpecs,
+          tool_choice: "auto",
+          parallel_tool_calls: true
+        });
+
+        const msg = completion.choices?.[0]?.message;
+        if (!msg) {
+          appendLog("No message returned from the model.", "err");
+          break;
+        }
+
+        // If the assistant requested tools, execute them and add tool results
+        const toolCalls = msg.tool_calls ?? [];
+        if (toolCalls.length > 0) {
+          messages.push(msg); // include assistant message that requested tool calls
+          appendLog(`Model requested ${toolCalls.length} tool call(s).`);
+
+          for (const call of toolCalls) {
+            const name = call.function?.name;
+            const argsStr = call.function?.arguments ?? "{}";
+            let parsed = {};
+            try {
+              parsed = JSON.parse(argsStr);
+            } catch (e) {
+              appendLog(`Failed to parse tool args for ${name}: ${argsStr}`, "err");
+              parsed = {};
+            }
+
+            // Execute locally against the SVG canvas
+            let result;
+            try {
+              const fn = toolRouter[name];
+              if (!fn) throw new Error(`Unknown tool: ${name}`);
+              result = fn(parsed);
+              appendLog(`Executed ${name}(${JSON.stringify(parsed)}) → ${JSON.stringify(result)}`, "ok");
+            } catch (e) {
+              result = { ok: false, error: String(e) };
+              appendLog(`Error executing ${name}: ${e}`, "err");
+            }
+
+            // Send tool result back
+            messages.push({
+              role: "tool",
+              tool_call_id: call.id,
+              content: JSON.stringify(result)
+            });
+          }
+          // loop continues to let the model finish
+          continue;
+        }
+
+        // No tool calls → final text
+        const final = msg.content ?? "";
+        if (final.trim()) appendLog(`Assistant: ${final}`);
+        break;
+      }
+    };
+
+    // Small demo prompt prefill
+    if (!userInput.value) {
+      userInput.value = "Draw a circle at (200,150) with radius 80. Then a line from (50,50) to (350,250). Finally a rectangle from (100,100) to (280,220).";
+    }
+  </script>
+</body>
+</html>
